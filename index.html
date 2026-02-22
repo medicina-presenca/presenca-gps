@@ -1,0 +1,276 @@
+import { z } from 'zod';
+import bcrypt from 'bcryptjs';
+import { router, publicProcedure, protectedProcedure } from '../trpc';
+import * as db from '../db/queries';
+import { createToken } from '../lib/jwt';
+import { TRPCError } from '@trpc/server';
+
+export const authRouter = router({
+  // Get current user
+  me: publicProcedure.query(({ ctx }) => {
+    return ctx.user ?? null;
+  }),
+
+  // Register with email/password
+  register: publicProcedure
+    .input(
+      z.object({
+        name: z.string().min(2, 'Name too short'),
+        email: z.string().email('Invalid email'),
+        password: z.string().min(6, 'Password must be at least 6 characters'),
+        appRole: z.enum(['professor', 'student']).default('student')
+      })
+    )
+    .mutation(async ({ input }) => {
+      try {
+        // Check allowed domains
+        const activeDomains = await db.getActiveDomains();
+        if (activeDomains.length > 0) {
+          const emailDomain = input.email.split('@')[1]?.toLowerCase() ?? '';
+          if (!activeDomains.includes(emailDomain)) {
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message: `Email not allowed. Use an institutional email: ${activeDomains
+                .map((d) => '@' + d)
+                .join(' or ')}`
+            });
+          }
+        }
+
+        // Check if email exists
+        const existing = await db.getUserByEmail(input.email);
+        if (existing) {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message: 'This email is already registered'
+          });
+        }
+
+        // Hash password
+        const passwordHash = await bcrypt.hash(input.password, 10);
+
+        // Create user - professors need approval
+        const approvalStatus = input.appRole === 'professor' ? 'pending' : 'approved';
+
+        const userId = await db.createUser({
+          name: input.name,
+          email: input.email,
+          passwordHash,
+          appRole: input.appRole,
+          approvalStatus,
+          isActive: true
+        });
+
+        // Get created user
+        const user = await db.getUserById(userId);
+        if (!user) {
+          throw new TRPCError({
+            code: 'INTERNAL_SERVER_ERROR',
+            message: 'Failed to create user'
+          });
+        }
+
+        // Create session token
+        const token = await createToken({ userId: user.id });
+
+        return {
+          success: true,
+          user: {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            appRole: user.appRole
+          },
+          token,
+          needsApproval: approvalStatus === 'pending'
+        };
+      } catch (error) {
+        if (error instanceof TRPCError) throw error;
+        console.error('[Auth] Register error:', error);
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: 'Registration failed'
+        });
+      }
+    }),
+
+  // Login with email/password
+  login: publicProcedure
+    .input(
+      z.object({
+        email: z.string().email('Invalid email'),
+        password: z.string().min(1, 'Password required')
+      })
+    )
+    .mutation(async ({ input }) => {
+      try {
+        const user = await db.getUserByEmail(input.email);
+
+        if (!user || !user.passwordHash) {
+          throw new TRPCError({
+            code: 'UNAUTHORIZED',
+            message: 'Invalid email or password'
+          });
+        }
+
+        // Check password
+        const valid = await bcrypt.compare(input.password, user.passwordHash);
+        if (!valid) {
+          throw new TRPCError({
+            code: 'UNAUTHORIZED',
+            message: 'Invalid email or password'
+          });
+        }
+
+        // Check if user is active
+        if (!user.isActive) {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: 'Account is deactivated'
+          });
+        }
+
+        // Check approval status for professors
+        if (user.appRole === 'professor' && user.approvalStatus !== 'approved') {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message:
+              user.approvalStatus === 'pending'
+                ? 'Your account is pending approval'
+                : 'Your account has been rejected'
+          });
+        }
+
+        // Update last signed in
+        await db.updateUserLastSignedIn(user.id);
+
+        // Create session token
+        const token = await createToken({ userId: user.id });
+
+        return {
+          success: true,
+          user: {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            appRole: user.appRole
+          },
+          token
+        };
+      } catch (error) {
+        if (error instanceof TRPCError) throw error;
+        console.error('[Auth] Login error:', error);
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: 'Login failed'
+        });
+      }
+    }),
+
+  // Logout
+  logout: protectedProcedure.mutation(({ ctx }) => {
+    ctx.res.clearCookie('auth_token');
+    return { success: true };
+  }),
+
+  // Request password reset
+  forgotPassword: publicProcedure
+    .input(z.object({ email: z.string().email() }))
+    .mutation(async ({ input }) => {
+      try {
+        const user = await db.getUserByEmail(input.email);
+
+        // Always return success to not leak email existence
+        if (!user) {
+          return { success: true };
+        }
+
+        // Generate unique token
+        const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        await db.createPasswordResetToken(user.id, token);
+
+        // In production, send email here
+        const resetLink = `${process.env.VITE_API_BASE_URL}/reset-password?token=${token}`;
+        console.log(`[ForgotPassword] Reset link for ${input.email}: ${resetLink}`);
+
+        return { success: true };
+      } catch (error) {
+        console.error('[Auth] ForgotPassword error:', error);
+        // Return success even on error to not leak information
+        return { success: true };
+      }
+    }),
+
+  // Validate reset token
+  validateResetToken: publicProcedure
+    .input(z.object({ token: z.string() }))
+    .query(async ({ input }) => {
+      try {
+        const record = await db.getPasswordResetToken(input.token);
+
+        if (!record) {
+          return { valid: false, reason: 'Invalid token' };
+        }
+
+        if (record.usedAt) {
+          return { valid: false, reason: 'Token already used' };
+        }
+
+        if (new Date() > record.expiresAt) {
+          return { valid: false, reason: 'Token expired' };
+        }
+
+        return { valid: true };
+      } catch (error) {
+        console.error('[Auth] ValidateResetToken error:', error);
+        return { valid: false, reason: 'Error validating token' };
+      }
+    }),
+
+  // Reset password with token
+  resetPassword: publicProcedure
+    .input(
+      z.object({
+        token: z.string(),
+        newPassword: z.string().min(6, 'Password must be at least 6 characters')
+      })
+    )
+    .mutation(async ({ input }) => {
+      try {
+        const record = await db.getPasswordResetToken(input.token);
+
+        if (!record) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: 'Invalid token' });
+        }
+
+        if (record.usedAt) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: 'Token already used' });
+        }
+
+        if (new Date() > record.expiresAt) {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message: 'Token expired. Request a new link.'
+          });
+        }
+
+        // Hash new password
+        const passwordHash = await bcrypt.hash(input.newPassword, 10);
+
+        // Update password
+        await db.updateUserPassword(record.userId, passwordHash);
+
+        // Mark token as used
+        await db.markPasswordResetTokenUsed(record.id);
+
+        return { success: true };
+      } catch (error) {
+        if (error instanceof TRPCError) throw error;
+        console.error('[Auth] ResetPassword error:', error);
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: 'Failed to reset password'
+        });
+      }
+    })
+});
